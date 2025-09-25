@@ -220,7 +220,7 @@ sfsistat mlfi_header(SMFICTX *ctx, char *headerf, char *headerv)
 				msg_len = 55 + len + priv->env_from_len;
 				msg = malloc(msg_len);
 				if (msg != NULL) { 
-				  snprintf(msg, msg_len, "Rejecting Envelope From (%s) and Header From (%s) mismatch", priv->env_from ? priv->env_from : "(null)", from ? from : "(null)");
+					snprintf(msg, msg_len, "Rejecting Envelope From (%s) and Header From (%s) mismatch", priv->env_from ? priv->env_from : "(null)", from ? from : "(null)");
 					log_event(ctx, msg);
 				}
 				free(msg);
