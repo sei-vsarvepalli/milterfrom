@@ -86,21 +86,21 @@ const char *parse_address(SMFICTX *ctx, const char *header, size_t *len) {
 
   const char *start = NULL;
   const char *end = NULL;
-  int open_count = 0;
+  int caret_count = 0;
   size_t i;
 
   /* Scan for angle brackets */
   for (i = 0; header[i]; i++) {
     if (header[i] == '<') {
-      open_count++;
+      caret_count++;
       start = header + i + 1; // Last '<'
     } else if (header[i] == '>') {
       if (!start) {
-	log_event(ctx, "Unmatched carrot < seen in header");
+	log_event(ctx, "Unmatched caret < seen in header");
 	return NULL; // unmatched '>'
       }
       if (end) {
-	open_count++;
+	caret_count++;
       }
       end = header + i;
     }
@@ -109,7 +109,7 @@ const char *parse_address(SMFICTX *ctx, const char *header, size_t *len) {
   /* Angle-bracketed address */
   if (start || end) {
     if (!start || !end) return NULL;   // unmatched brackets
-    if (reject_multiple_from && open_count != 1) {
+    if (reject_multiple_from && caret_count != 1) {
       log_event(ctx, "Rejecting due to multiple sender addresses embedded Grouping");
       return NULL;
     }
@@ -124,7 +124,7 @@ const char *parse_address(SMFICTX *ctx, const char *header, size_t *len) {
     /* Reject control characters */
     for (const char *p = start; p < end; p++) {
       if ((unsigned char)*p < 32 || *p == 127) {
-	log_event(ctx, "Rejecting due to non-ascii characters found inside email address");
+	log_event(ctx, "Rejecting due to control characters found inside email address");
 	return NULL;
       }
     }
@@ -341,8 +341,8 @@ int main(int argc, char **argv)
 			um = strtol(optarg, 0, 8);
 			break;
 		case 'r':   /* --reject-multi-from */
-		        reject_multiple_from = 1;
-		        break;
+                        reject_multiple_from = 1;
+                        break;
 		case 'h':
 			usage(stdout);
 			return EXIT_SUCCESS;
