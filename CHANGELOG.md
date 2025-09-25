@@ -15,3 +15,7 @@ Version 1.0.2  2023-09-18
 Version 1.0.3 2025-09-24
 * Added verification of no control characters inside carrots.
 [See references https://blog.slonser.info/posts/email-attacks/ ]
+
+Version 1.0.4 2025-10-05
+* Added option to reject on multiple From: address fields like From:Grouping<g@example> <auth@example.com>
+* This requires use of optional `-r` argument for blocking

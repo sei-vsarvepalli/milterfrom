@@ -43,7 +43,6 @@
 #include <grp.h>
 #include <stdint.h>
 #include <syslog.h>
-
 #include <ctype.h>
 #include <stddef.h>
 
@@ -57,51 +56,64 @@ struct mlfiPriv {
 	int reject;
 };
 
+static int reject_multiple_from = 0;
+
 #define MLFIPRIV ((struct mlfiPriv*)smfi_getpriv(ctx))
-#define VERSION "1.0.3"
+#define VERSION "1.0.4"
 
 extern const char *__progname;
 
 static unsigned long mta_caps = 0;
 
+void log_event(SMFICTX *ctx, char *msg) {
+	/* Log event with additional information */
+	const char *author = smfi_getsymval(ctx, "{auth_authen}");
+	const char *info = smfi_getsymval(ctx,"_");
+	syslog(LOG_INFO,"%s for authenticated user (%s) from (%s)", msg, author, info);
+}
+
+
+
 // Function to extract addresses from the header/envelope fields.  If the field
 // contains a < with a subsequent >, the inner part is used. If not, the whole
 // header field is used. This allows matching "Max Mustermann
 // <max.mustermann@example.invalid>".
-const char *parse_address(const char *header, size_t *len) {
-    if (!header || !len) return NULL;
+// Returns null if the address has non-ascii or control characters
+// Added ability to reject multiple address such as Grouping like
+// From: Group<group@example.com>:<authenticated@example.com>
+const char *parse_address(SMFICTX *ctx, const char *header, size_t *len) {
+  if (!header || !len) return NULL;
 
-    const char *start = NULL;
-    const char *end = NULL;
-    size_t i;
+  const char *start = NULL;
+  const char *end = NULL;
+  int open_count = 0;
+  size_t i;
 
-    /* Find the last '<' and the corresponding '>' */
-    for (i = 0; header[i]; i++) {
-        if (header[i] == '<') start = header + i + 1;
-        else if (header[i] == '>') end = header + i;
+  /* Scan for angle brackets */
+  for (i = 0; header[i]; i++) {
+    if (header[i] == '<') {
+      open_count++;
+      start = header + i + 1; // Last '<'
+    } else if (header[i] == '>') {
+      if (!start) {
+	log_event(ctx, "Unmatched carrot < seen in header");
+	return NULL; // unmatched '>'
+      }
+      if (end) {
+	open_count++;
+      }
+      end = header + i;
+    }
+  }
+
+  /* Angle-bracketed address */
+  if (start || end) {
+    if (!start || !end) return NULL;   // unmatched brackets
+    if (reject_multiple_from && open_count != 1) {
+      log_event(ctx, "Rejecting due to multiple sender addresses embedded Grouping");
+      return NULL;
     }
 
-    if (start && end && start < end) {
-        /* Trim whitespace from start */
-        while (start < end && isspace((unsigned char)*start)) start++;
-        /* Trim whitespace from end */
-        while (end > start && isspace((unsigned char)*(end-1))) end--;
-
-        /* Reject if empty */
-        if (end <= start) return NULL;
-
-        /* Reject if any control chars (\r, \n, 0x00-0x1F, 0x7F) */
-        for (const char *p = start; p < end; p++) {
-            if ((unsigned char)*p < 32 || *p == 127) return NULL;
-        }
-
-        *len = (size_t)(end - start);
-        return start;
-    }
-
-    /* No angle brackets: treat the entire header as address */
-    start = header;
-    end = header + strlen(header);
 
     /* Trim whitespace */
     while (start < end && isspace((unsigned char)*start)) start++;
@@ -111,19 +123,34 @@ const char *parse_address(const char *header, size_t *len) {
 
     /* Reject control characters */
     for (const char *p = start; p < end; p++) {
-        if ((unsigned char)*p < 32 || *p == 127) return NULL;
+      if ((unsigned char)*p < 32 || *p == 127) {
+	log_event(ctx, "Rejecting due to non-ascii characters found inside email address");
+	return NULL;
+      }
     }
 
     *len = (size_t)(end - start);
     return start;
-}
+  }
 
-void log_event(SMFICTX *ctx, char *msg) {
-	/* Log event with additional information */
-	const char *author = smfi_getsymval(ctx, "{auth_authen}");
-	const char *info = smfi_getsymval(ctx,"_");
-	syslog(LOG_INFO,"%s for authenticated user (%s) from (%s)", msg, author, info);
-} 
+  /* No angle brackets: use the entire header */
+  start = header;
+  end = header + strlen(header);
+
+  /* Trim whitespace */
+  while (start < end && isspace((unsigned char)*start)) start++;
+  while (end > start && isspace((unsigned char)*(end-1))) end--;
+
+  if (end <= start) return NULL;
+
+  /* Reject control characters */
+  for (const char *p = start; p < end; p++) {
+    if ((unsigned char)*p < 32 || *p == 127) return NULL;
+  }
+
+  *len = (size_t)(end - start);
+  return start;
+}
 
 void mlfi_cleanup(SMFICTX *ctx)
 {
@@ -149,7 +176,7 @@ sfsistat mlfi_envfrom(SMFICTX *ctx, char **envfrom)
 
 	// Parse envelope from.
 	size_t len = 0;
-	const char *from = parse_address(*envfrom, &len);
+	const char *from = parse_address(ctx, *envfrom, &len);
 	if (len == 0) {
 		/* A 0 length from address means a "null reverse-path", which is valid per
 		 * RFC5321. */
@@ -182,7 +209,7 @@ sfsistat mlfi_header(SMFICTX *ctx, char *headerf, char *headerv)
 	if (priv->is_auth && !priv->reject) {
 		if (strcasecmp(headerf, "from") == 0) {
 			size_t len = 0;
-			const char *from = parse_address(headerv, &len);
+			const char *from = parse_address(ctx, headerv, &len);
 
 			// Check whether header from matches envelope from and reject if not.
 			if (len != priv->env_from_len || strncasecmp(from, priv->env_from, len) != 0) {
@@ -193,7 +220,7 @@ sfsistat mlfi_header(SMFICTX *ctx, char *headerf, char *headerv)
 				msg_len = 55 + len + priv->env_from_len;
 				msg = malloc(msg_len);
 				if (msg != NULL) { 
-					snprintf(msg, msg_len, "Rejecting Envelope From (%s) and Header From (%s) mismatch", priv->env_from, from);
+				  snprintf(msg, msg_len, "Rejecting Envelope From (%s) and Header From (%s) mismatch", priv->env_from ? priv->env_from : "(null)", from ? from : "(null)");
 					log_event(ctx, msg);
 				}
 				free(msg);
@@ -274,8 +301,10 @@ static void usage(FILE *stream) {
 	fprintf(stream, "%s: usage: %s -s socketfile [options]\n"
 		"\t-p pidfile  \twrite process ID to pidfile name\n"
 		"\t-d          \tdaemonize to background and exit\n"
+		"\t-m mask     \tuse specified mask for the socketfile\n"
 		"\t-u userid   \tchange to specified userid\n"
 		"\t-g groupid  \tchange to specific groupid\n"
+		"\t-r          \tReject on multiple addresses like Grouping\n"
 		"\t-v          \tprint version number and terminate\n",
 		__progname, __progname);
 }
@@ -291,7 +320,7 @@ int main(int argc, char **argv)
 	u_int mvminor;
 	u_int mvrelease;
 
-	while ((c = getopt(argc, argv, "dhvs:p:u:g:m:")) != -1) {
+	while ((c = getopt(argc, argv, "drhvs:p:u:g:m:")) != -1) {
 		switch (c) {
 		case 's':
 			sockname = strdup(optarg);
@@ -308,9 +337,12 @@ int main(int argc, char **argv)
 		case 'g':
 			gid = get_gid(optarg);
 			break;
-		case 'm':
+		case 'm': /* chmod the socket appropriately */
 			um = strtol(optarg, 0, 8);
 			break;
+		case 'r':   /* --reject-multi-from */
+		        reject_multiple_from = 1;
+		        break;
 		case 'h':
 			usage(stdout);
 			return EXIT_SUCCESS;
