@@ -71,7 +71,7 @@ void log_event(SMFICTX *ctx, char *msg) {
 	/* Log event with additional information */
 	const char *author = smfi_getsymval(ctx, "{auth_authen}");
 	const char *info = smfi_getsymval(ctx,"_");
-	syslog(LOG_INFO,"%s for authenticated user (%s) from (%s)", msg, author ? author : "(null)", info);
+	syslog(LOG_INFO,"%s for authenticated user (%s) from (%s)", msg, author ? author : "(null)", info ? info : "(null)");
 }
 
 
