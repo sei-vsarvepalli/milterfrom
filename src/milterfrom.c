@@ -98,7 +98,7 @@ const char *parse_address(SMFICTX *ctx, const char *header, size_t *len) {
       start = header + i + 1; // Last '<'
     } else if (header[i] == '>') {
       if (!start) {
-	log_event(ctx, "Unmatched carrot < seen in header");
+	log_event(ctx, "Unmatched angle bracket < seen in header");
 	return NULL; // unmatched '>'
       }
       if (end) {
