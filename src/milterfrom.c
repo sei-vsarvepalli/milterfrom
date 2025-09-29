@@ -57,6 +57,8 @@ struct mlfiPriv {
 };
 
 static int reject_multiple_from = 0;
+static int reject_null_envfrom = 0;
+
 
 #define MLFIPRIV ((struct mlfiPriv*)smfi_getpriv(ctx))
 #define VERSION "1.0.4"
@@ -69,7 +71,7 @@ void log_event(SMFICTX *ctx, char *msg) {
 	/* Log event with additional information */
 	const char *author = smfi_getsymval(ctx, "{auth_authen}");
 	const char *info = smfi_getsymval(ctx,"_");
-	syslog(LOG_INFO,"%s for authenticated user (%s) from (%s)", msg, author, info);
+	syslog(LOG_INFO,"%s for authenticated user (%s) from (%s)", msg, author ? author : "(null)", info);
 }
 
 
@@ -86,21 +88,21 @@ const char *parse_address(SMFICTX *ctx, const char *header, size_t *len) {
 
   const char *start = NULL;
   const char *end = NULL;
-  int caret_count = 0;
+  int open_count = 0;
   size_t i;
 
   /* Scan for angle brackets */
   for (i = 0; header[i]; i++) {
     if (header[i] == '<') {
-      caret_count++;
+      open_count++;
       start = header + i + 1; // Last '<'
     } else if (header[i] == '>') {
       if (!start) {
-	log_event(ctx, "Unmatched caret < seen in header");
+	log_event(ctx, "Unmatched carrot < seen in header");
 	return NULL; // unmatched '>'
       }
       if (end) {
-	caret_count++;
+	open_count++;
       }
       end = header + i;
     }
@@ -109,7 +111,7 @@ const char *parse_address(SMFICTX *ctx, const char *header, size_t *len) {
   /* Angle-bracketed address */
   if (start || end) {
     if (!start || !end) return NULL;   // unmatched brackets
-    if (reject_multiple_from && caret_count != 1) {
+    if (reject_multiple_from && open_count != 1) {
       log_event(ctx, "Rejecting due to multiple sender addresses embedded Grouping");
       return NULL;
     }
@@ -124,7 +126,7 @@ const char *parse_address(SMFICTX *ctx, const char *header, size_t *len) {
     /* Reject control characters */
     for (const char *p = start; p < end; p++) {
       if ((unsigned char)*p < 32 || *p == 127) {
-	log_event(ctx, "Rejecting due to control characters found inside email address");
+	log_event(ctx, "Rejecting due to non-ascii characters found inside email address");
 	return NULL;
       }
     }
@@ -176,24 +178,24 @@ sfsistat mlfi_envfrom(SMFICTX *ctx, char **envfrom)
 
 	// Parse envelope from.
 	size_t len = 0;
+	/* We assume envfrom validation is done by SMTP software */
 	const char *from = parse_address(ctx, *envfrom, &len);
-	if (len == 0) {
-		/* A 0 length from address means a "null reverse-path", which is valid per
-		 * RFC5321. */
-		log_event(ctx, "Accepting message as envelope sender is null");
-		return SMFIS_ACCEPT;
-	}
-	fromcp = strndup(from, len);
-	if (fromcp == NULL) {
-		return SMFIS_TEMPFAIL;
-	}
-
-	// Set private values.
 	priv->is_auth = smfi_getsymval(ctx, "{auth_type}") ? 1 : 0;
-	priv->env_from = fromcp;
-	priv->env_from_len = len;
-	priv->reject = 0;
+	if (len == 0) {
+	  /* A 0 length from address means a "null reverse-path",
+	     which is valid per * RFC5321. */
+	  priv->env_from = NULL;
+	} else {
+	  fromcp = strndup(from, len);
+	  if (fromcp == NULL) {
+	    return SMFIS_TEMPFAIL;
+	  }
 
+	  // Set private values.
+	  priv->env_from = fromcp;
+	  priv->env_from_len = len;
+	  priv->reject = 0;
+	}
 	smfi_setpriv(ctx, priv);
 
 	return SMFIS_CONTINUE;
@@ -204,28 +206,40 @@ sfsistat mlfi_header(SMFICTX *ctx, char *headerf, char *headerv)
 	struct mlfiPriv *priv = MLFIPRIV;
 
 	if (priv == NULL) return SMFIS_CONTINUE;
-
 	// Perform checks if the sender is authenticated and the message is not rejected yet (the mail may contain multiple from tags, all have to match!).
-	if (priv->is_auth && !priv->reject) {
-		if (strcasecmp(headerf, "from") == 0) {
-			size_t len = 0;
-			const char *from = parse_address(ctx, headerv, &len);
+	if (strcasecmp(headerf, "from") == 0) {
+	  if (priv->is_auth && !priv->reject) {
+	    size_t len = 0;
+	    const char *from = parse_address(ctx, headerv, &len);
 
-			// Check whether header from matches envelope from and reject if not.
-			if (len != priv->env_from_len || strncasecmp(from, priv->env_from, len) != 0) {
-				char *msg;
-				size_t msg_len = 0;
-
-				priv->reject = 1;
-				msg_len = 55 + len + priv->env_from_len;
-				msg = malloc(msg_len);
-				if (msg != NULL) { 
-					snprintf(msg, msg_len, "Rejecting Envelope From (%s) and Header From (%s) mismatch", priv->env_from ? priv->env_from : "(null)", from ? from : "(null)");
-					log_event(ctx, msg);
-				}
-				free(msg);
-			}
-		}
+	    if(reject_null_envfrom && priv->env_from == NULL) {
+	      /* check if authenticated ,
+		 accept read-receipts if authenticated
+		 user matches the from address */
+	      char *auth_authen = smfi_getsymval(ctx, "{auth_authen}");
+	      if (auth_authen &&
+		  strlen(auth_authen) == len &&
+		  strncasecmp(auth_authen, from, strlen(auth_authen)) == 0) {
+		log_event(ctx,"Accepting read receipt when the authentication matches, although sender is NULL");
+	      } else {
+		log_event(ctx,"Setting up to reject null envfrom sender as configured");
+		priv->reject = 1;
+	      }
+	    } else if (from == NULL) {
+	      priv->reject = 1;
+	    } else if (len != priv->env_from_len || strncasecmp(from, priv->env_from, len) != 0) {
+	      char *msg;
+	      size_t msg_len = 0;
+	      priv->reject = 1;
+	      msg_len = 55 + len + priv->env_from_len;
+	      msg = malloc(msg_len);
+	      if (msg != NULL) { 
+		snprintf(msg, msg_len, "Rejecting Envelope From (%s) and Header From (%s) mismatch", priv->env_from ? priv->env_from : "(null)", from ? from : "(null)");
+		log_event(ctx, msg);
+	      }
+	      free(msg);
+	    }
+	  }
 	}
 
 	return ((mta_caps & SMFIP_NR_HDR) != 0) ? SMFIS_NOREPLY : SMFIS_CONTINUE;
@@ -305,6 +319,7 @@ static void usage(FILE *stream) {
 		"\t-u userid   \tchange to specified userid\n"
 		"\t-g groupid  \tchange to specific groupid\n"
 		"\t-r          \tReject on multiple addresses like Grouping\n"
+		"\t-n          \tReject on null envfrom sender, unless authentication matches the header From: field\n"
 		"\t-v          \tprint version number and terminate\n",
 		__progname, __progname);
 }
@@ -320,7 +335,7 @@ int main(int argc, char **argv)
 	u_int mvminor;
 	u_int mvrelease;
 
-	while ((c = getopt(argc, argv, "drhvs:p:u:g:m:")) != -1) {
+	while ((c = getopt(argc, argv, "dhvrns:p:u:g:m:")) != -1) {
 		switch (c) {
 		case 's':
 			sockname = strdup(optarg);
@@ -341,8 +356,11 @@ int main(int argc, char **argv)
 			um = strtol(optarg, 0, 8);
 			break;
 		case 'r':   /* --reject-multi-from */
-                        reject_multiple_from = 1;
-                        break;
+		        reject_multiple_from = 1;
+		        break;
+		case 'n':   /* --null-sender-reject */
+		        reject_null_envfrom = 1;
+		        break;
 		case 'h':
 			usage(stdout);
 			return EXIT_SUCCESS;
